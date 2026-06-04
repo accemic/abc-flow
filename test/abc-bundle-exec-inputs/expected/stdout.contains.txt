@@ -1,0 +1,6 @@
+tb/top.abc
+ip/mod.abc
+tools/generate_data.py
+data/input.rdl
+ip/mod.sv
+tb/top_tb.sv

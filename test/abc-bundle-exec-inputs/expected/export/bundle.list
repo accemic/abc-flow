@@ -1,0 +1,6 @@
+ABC	tb/top.abc
+ABC	ip/mod.abc
+AUX	tools/generate_data.py
+AUX	data/input.rdl
+SRC	ip/mod.sv
+SIM	tb/top_tb.sv

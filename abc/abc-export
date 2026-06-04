@@ -1,0 +1,965 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_abc_collector_lib.sh
+. "$SCRIPT_DIR/_abc_collector_lib.sh"
+
+usage() {
+	cat >&2 <<'USAGE'
+Usage:
+  scripts/abc-export <input.abc|input_without_ext> <out_dir> [--list-only] [--records-only] [--abc|--generate-abc] [--preserve-tree] [--root <repo_root>] [--source-tcl] [--run-exec] [-- [user args...]]
+
+Behavior:
+  - Traverses .abc dependencies and collects files referenced via:
+      read_sv, read_sim, constraints, simulate, build, and non-.abc source <file>
+  - Prints one copied path per line relative to <out_dir>.
+  - Copies collected files flat into <out_dir> unless --preserve-tree is provided.
+  - Fails on basename collisions when flattening.
+
+Artifacts written into <out_dir> (unless --list-only):
+  - README.md        : export metadata + notes
+  - copied.list      : paths as copied into <out_dir>
+  - sources.list     : original source paths (relative to repo root when possible)
+  - add_to_vivado.tcl : Vivado snippet to add all sources + apply constraints
+  - <input_basename>.abc : optional replay .abc using exported local files
+USAGE
+	exit 2
+}
+
+tcl_escape_braces() {
+	local value="$1"
+	value=${value//\\/\\\\}
+	value=${value//\{/\\\{}
+	value=${value//\}/\\\}}
+	printf '%s' "$value"
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+	usage
+fi
+
+if [[ $# -lt 2 ]]; then
+	usage
+fi
+
+INPUT="$1"
+OUT_DIR="$2"
+LIST_ONLY=0
+RECORDS_ONLY=0
+GENERATE_ABC=0
+PRESERVE_TREE=0
+ROOT_OVERRIDE=""
+SOURCE_TCL=0
+RUN_EXEC=0
+USER_ARGS=()
+shift 2
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--list-only) LIST_ONLY=1; shift ;;
+		--records-only) RECORDS_ONLY=1; shift ;;
+		--abc|--generate-abc) GENERATE_ABC=1; shift ;;
+		--preserve-tree) PRESERVE_TREE=1; shift ;;
+		--root)
+			if [[ $# -lt 2 ]]; then
+				echo "ERROR: abc-export: --root requires a value" >&2
+				exit 2
+			fi
+			ROOT_OVERRIDE="$2"
+			shift 2 ;;
+		--source-tcl) SOURCE_TCL=1; shift ;;
+		--run-exec) RUN_EXEC=1; shift ;;
+		--)
+			shift
+			USER_ARGS=("$@")
+			break ;;
+		--constraints-map|--no-constraints-map)
+			echo "ERROR: abc-export: constraints.tsv mapping was replaced by export_vivado.tcl; please remove '$1'" >&2
+			exit 2;;
+		*) echo "ERROR: abc-export: unknown argument: $1" >&2; usage ;;
+	esac
+done
+
+ROOT="$(abc_collector_detect_root "$INPUT" "$ROOT_OVERRIDE")"
+TCLSH="$(abc_collector_require_tclsh abc-export)"
+
+# -----------------------------------------------------------------------------
+# Collector: create a temporary Tcl script (embedded here) and execute it.
+# It prints one dependency per line in the format:
+#   <kind>\t<value1>\t<value2>\t<value3>
+# where:
+#   kind: SRC | SIM | XDC | ACTION | PROP | UNSUPPORTED
+#   value1/value2/value3 by kind:
+#     SRC:    path | "" | ""
+#     SIM:    path | "" | ""
+#     XDC:    path | used_in | scope
+#     ACTION: simulate|build | argument | ""
+#     PROP:   property | value | ""
+#     UNSUPPORTED: command | detail | ""
+# -----------------------------------------------------------------------------
+TMP_TCL="$(abc_collector_mktemp_tcl abc_export)"
+
+# Compose the Tcl script: the shared collector preamble, the tool-name
+# stamp used by `die` and friends, then the export-specific extension.
+{
+	cat "$SCRIPT_DIR/_abc_collector.tcl"
+	cat <<'TCL'
+
+set ::abc::tool_name abc-export
+
+namespace eval abc {
+	variable simset_token "__abc_simset__"
+	variable synthset_token "__abc_fileset__"
+	variable project_token "__abc_project__"
+	array set seen_imports {}
+	# Keep first-seen order for deterministic output.
+	variable src_order {}
+	variable sim_order {}
+	variable xdc_order {}
+	variable prop_order {}
+	variable unsupported_order {}
+	variable actions {}
+	# kind -> set(abs)=1
+	array set src {}
+	array set sim {}
+	# constraints entries: key => list(path abs used_in X scope Y)
+	array set xdc {}
+	array set sim_props {}
+	array set unsupported {}
+
+		proc reset {_anchor} {
+			variable anchor
+			set anchor [file normalize $_anchor]
+			variable src_order
+			set src_order {}
+			variable sim_order
+			set sim_order {}
+			variable xdc_order
+			set xdc_order {}
+			variable prop_order
+			set prop_order {}
+			variable unsupported_order
+			set unsupported_order {}
+			variable actions
+			set actions {}
+			array unset ::abc::seen_imports
+			array set ::abc::seen_imports {}
+			array unset ::abc::src
+		array set ::abc::src {}
+		array unset ::abc::sim
+		array set ::abc::sim {}
+			array unset ::abc::xdc
+			array set ::abc::xdc {}
+			array unset ::abc::sim_props
+			array set ::abc::sim_props {}
+			array unset ::abc::unsupported
+			array set ::abc::unsupported {}
+			variable errors
+			set errors {}
+		}
+
+		proc record_into {arrName path} {
+			upvar 1 $arrName arr
+			set abs [file normalize [file join [pwd] $path]]
+			if {![file exists $abs]} { add_error "Missing file: $abs"; return }
+			if {![info exists arr($abs)]} {
+				set arr($abs) 1
+				if {$arrName eq "::abc::src"} {
+					variable src_order
+					lappend src_order $abs
+				} elseif {$arrName eq "::abc::sim"} {
+					variable sim_order
+					lappend sim_order $abs
+				}
+			}
+		}
+
+		proc record_constraint {path used_in scope {transitive 0}} {
+			set abs [file normalize [file join [pwd] $path]]
+			if {![file exists $abs]} { add_error "Missing file: $abs"; return }
+			set key "$abs|$used_in|$scope"
+			if {![info exists ::abc::xdc($key)]} {
+				set ::abc::xdc($key) [list path $abs used_in $used_in \
+				                           scope $scope transitive $transitive]
+				variable xdc_order
+				lappend xdc_order $key
+				# Recursively follow Tcl `source` directives inside the XDC.
+				# Sourced files are loaded by the parent at Vivado-runtime;
+				# they must be copied into the export but NOT re-issued as
+				# explicit `read_xdc` calls (would double-load).
+				::abc::scan_xdc_for_sources $abs $used_in $scope
+			}
+		}
+
+		# Scan an XDC file for `source` Tcl directives and record any
+		# referenced files as transitive constraints. Handles:
+		#   A. source [file join [file dirname [info script]] <path>]
+		#   B. source <relative-or-absolute-path>
+		# Multi-line `source` calls split with `\` line continuation are
+		# joined first so the regex matches across the wrap.
+		proc scan_xdc_for_sources {abs_path used_in scope} {
+			if {[catch {open $abs_path r} fh]} { return }
+			set raw [read $fh]
+			close $fh
+			# Join Tcl backslash-newline continuations.
+			regsub -all -- {\\\n[ \t]*} $raw " " raw
+			set xdc_dir [file dirname $abs_path]
+			foreach line [split $raw "\n"] {
+				set trimmed [string trimleft $line]
+				if {[string index $trimmed 0] eq "#"} continue
+				# Pattern A: source [file join [file dirname [info script]] <path>]
+				if {[regexp -nocase \
+				        {source[ \t]+\[file[ \t]+join[ \t]+\[file[ \t]+dirname[ \t]+\[info[ \t]+script\]\][ \t]+([^\]]+?)[ \t]*\]} \
+				        $line -> rel]} {
+					set rel [string trim $rel]
+					set sourced [file normalize [file join $xdc_dir $rel]]
+					record_constraint $sourced $used_in $scope 1
+					continue
+				}
+				# Pattern B: source <path>  (skip command-substitution forms with `[`)
+				if {[regexp {^[ \t]*source[ \t]+([^\[\s][^\s]*)} $trimmed -> rel]} {
+					set sourced [file normalize [file join $xdc_dir $rel]]
+					record_constraint $sourced $used_in $scope 1
+				}
+			}
+		}
+
+		proc record_action {kind arg} {
+			variable actions
+			lappend actions [list $kind $arg]
+		}
+
+		proc record_unsupported {command {detail ""}} {
+			set command [string trim $command]
+			set detail [string trim $detail]
+			if {$command eq ""} { return "" }
+			set key "$command\t$detail"
+			if {![info exists ::abc::unsupported($key)]} {
+				set ::abc::unsupported($key) [list command $command detail $detail]
+				variable unsupported_order
+				lappend unsupported_order $key
+			}
+			return ""
+		}
+
+		proc is_simset_object {obj} {
+			variable simset_token
+			expr {$obj eq $simset_token || $obj eq "sim_1"}
+		}
+
+		proc is_project_object {obj} {
+			variable project_token
+			expr {$obj eq $project_token}
+		}
+
+		proc set_simset_property {name value} {
+			set key [string trim $name]
+			if {$key eq ""} { return "" }
+			if {$key ni {"generic" "verilog_define" "xsim.simulate.xsim.more_options"}} {
+				return ""
+			}
+			if {$key eq "xsim.simulate.xsim.more_options"} {
+				set normalized [list {*}$value]
+			} else {
+				set normalized [concat {*}$value]
+			}
+			if {![info exists ::abc::sim_props($key)]} {
+				variable prop_order
+				lappend prop_order $key
+			}
+			set ::abc::sim_props($key) $normalized
+			return ""
+		}
+
+		proc get_simset_property {name} {
+			set key [string trim $name]
+			if {[info exists ::abc::sim_props($key)]} {
+				return $::abc::sim_props($key)
+			}
+			return ""
+		}
+
+	proc import {args} {
+		foreach dep [resolve {*}$args] {
+			if {[info exists ::abc::seen_imports($dep)]} { continue }
+			set ::abc::seen_imports($dep) 1
+			set save_dir [pwd]
+			set ref [file tail [file rootname $dep]]
+			set dir [file dirname $dep]
+			set abc_file [file join $dir "$ref.abc"]
+			if {![file exists $abc_file]} { add_error "Missing .abc: $abc_file"; continue }
+			cd $dir
+			::tcl_source "$ref.abc"
+			cd $save_dir
+		}
+	}
+
+	proc read_sv {args} {
+		foreach a $args { foreach p $a { record_into ::abc::src $p } }
+		return ""
+	}
+	proc read_sim {args} {
+		foreach a $args { foreach p $a { record_into ::abc::sim $p } }
+		return ""
+	}
+	proc constraints {args} {
+		upvar ref _ref
+		set used_in "both"
+		set scope "UNKNOWN"
+		if {[info exists _ref] && ($_ref ne "")} { set scope $_ref }
+		set is_top 0
+		set rest {}
+		set idx 0
+		while {$idx < [llength $args]} {
+			set tok [lindex $args $idx]
+			switch -- $tok {
+				-top  { set is_top 1; incr idx; continue }
+				impl  { set used_in "implementation"; incr idx; continue }
+				synth { set used_in "synthesis"; incr idx; continue }
+				default { set rest [lrange $args $idx end]; break }
+			}
+		}
+		if {$is_top} { set scope "TOP" }
+		foreach a $rest { foreach p $a { record_constraint $p $used_in $scope } }
+		return ""
+	}
+
+	# Best-effort fallbacks
+	proc read_verilog {args} {
+		set rest {}
+		set idx 0
+		while {$idx < [llength $args]} {
+			set tok [lindex $args $idx]
+			if {[string match -* $tok]} { incr idx; continue }
+			set rest [lrange $args $idx end]
+			break
+		}
+		foreach a $rest { foreach p $a { record_into ::abc::src $p } }
+		return ""
+	}
+	proc add_files {args} {
+		set rest {}
+		foreach tok $args { if {[string match -* $tok]} { continue }; lappend rest $tok }
+		foreach a $rest { foreach p $a { record_into ::abc::sim $p } }
+		return ""
+	}
+	proc set_property {args} {
+		if {[llength $args] == 0} { return "" }
+
+		set name ""
+		set value ""
+		set objects ""
+
+		if {[lindex $args 0] eq "-name"} {
+			set idx 0
+			while {$idx < [llength $args]} {
+				set tok [lindex $args $idx]
+				switch -- $tok {
+					-name {
+						incr idx
+						if {$idx < [llength $args]} { set name [lindex $args $idx] }
+					}
+					-value {
+						incr idx
+						if {$idx < [llength $args]} { set value [lindex $args $idx] }
+					}
+					-objects {
+						incr idx
+						if {$idx < [llength $args]} { set objects [lindex $args $idx] }
+					}
+				}
+				incr idx
+			}
+		} elseif {[llength $args] >= 3} {
+			set name [lindex $args 0]
+			set value [lindex $args 1]
+			set objects [lindex $args 2]
+		}
+
+		if {[is_simset_object $objects]} {
+			return [set_simset_property $name $value]
+		}
+		return ""
+	}
+	proc get_files {args} { return "" }
+	proc get_filesets {args} {
+		variable simset_token
+		if {[llength $args] > 0 && [lindex $args 0] eq "sim_1"} {
+			return $simset_token
+		}
+		return $simset_token
+	}
+	proc get_property {name object} {
+		if {[is_simset_object $object]} {
+			return [get_simset_property $name]
+		}
+		if {[is_project_object $object] && $name eq "DIRECTORY"} {
+			return [pwd]
+		}
+		return ""
+	}
+	proc get_runs {args} { return "" }
+	proc get_projects {args} {
+		record_unsupported get_projects [join $args " "]
+		return ""
+	}
+	proc get_ips {args} {
+		record_unsupported get_ips [join $args " "]
+		return [join $args " "]
+	}
+	proc current_project {args} {
+		variable project_token
+		return $project_token
+	}
+	proc current_fileset {args} {
+		variable simset_token
+		variable synthset_token
+		if {[lsearch -exact $args -simset] >= 0} {
+			return $simset_token
+		}
+		return $synthset_token
+	}
+	proc current_run {args} { return "" }
+	proc create_ip {args} {
+		set module_name ""
+		set idx 0
+		while {$idx < [llength $args]} {
+			set tok [lindex $args $idx]
+			if {$tok eq "-module_name" && ($idx + 1) < [llength $args]} {
+				set module_name [lindex $args [expr {$idx + 1}]]
+				incr idx
+			}
+			incr idx
+		}
+		record_unsupported create_ip $module_name
+		if {$module_name eq ""} {
+			set module_name "abc_ip"
+		}
+		return [file normalize [file join [pwd] "${module_name}.xci"]]
+	}
+	proc create_project {args} {
+		record_unsupported create_project [join $args " "]
+		return ""
+	}
+	proc open_project {args} {
+		record_unsupported open_project [join $args " "]
+		return ""
+	}
+	proc generate_target {args} {
+		record_unsupported generate_target [join $args " "]
+		return ""
+	}
+	proc export_ip_user_files {args} {
+		record_unsupported export_ip_user_files [join $args " "]
+		return ""
+	}
+	proc import_files {args} { return "" }
+	proc read_ip {args} {
+		record_unsupported read_ip [join $args " "]
+		return ""
+	}
+	proc upgrade_ip {args} {
+		record_unsupported upgrade_ip [join $args " "]
+		return ""
+	}
+	proc convert_ips {args} {
+		record_unsupported convert_ips [join $args " "]
+		return ""
+	}
+	proc synth_ip {args} {
+		record_unsupported synth_ip [join $args " "]
+		return ""
+	}
+	proc launch_runs {args} {
+		record_unsupported launch_runs [join $args " "]
+		return ""
+	}
+		proc build {top} {
+			record_action build $top
+			return ""
+		}
+		proc simulate {tb} {
+			record_action simulate $tb
+			return ""
+		}
+		proc synthesize {args} { return "" }
+		proc version {args} { return "0.0" }
+	}
+
+namespace import ::abc::*
+
+set ::abc::collector_source_tcl 0
+set ::abc::collector_run_exec 0
+
+# Override source: execute .abc, optionally execute .tcl, record others as SIM.
+if {[llength [info commands ::tcl_source]] == 0} {
+	rename ::source ::tcl_source
+}
+proc ::source {fileName args} {
+	set abs [file normalize [file join [pwd] $fileName]]
+	set ext [file extension $abs]
+	if {$ext eq ".abc"} {
+		return [uplevel 1 [list ::tcl_source $fileName {*}$args]]
+	}
+	if {$ext eq ".tcl"} {
+		if {$::abc::collector_source_tcl} {
+			return [uplevel 1 [list ::tcl_source $fileName {*}$args]]
+		}
+		return ""
+	}
+	::abc::record_into ::abc::sim $fileName
+	return ""
+}
+
+# Override exec; ::puts override comes from the shared collector preamble.
+if {[llength [info commands ::tcl_exec]] == 0} { rename ::exec ::tcl_exec }
+proc ::exec {args} {
+	if {$::abc::collector_run_exec} {
+		return [::tcl_exec {*}$args]
+	}
+	return ""
+}
+
+		proc usage {} {
+			::tcl_puts stderr "Usage: tclsh <collector.tcl> [--root <repo_root>] [--source-tcl] [--run-exec] <task_or_abc> [-- user args...]"
+			exit 2
+		}
+
+set root ""
+set task ""
+set source_tcl 0
+set run_exec 0
+set user_argv {}
+
+set argv_copy $argv
+while {[llength $argv_copy] > 0} {
+	set a [lindex $argv_copy 0]
+	switch -- $a {
+		--root {
+			if {[llength $argv_copy] < 2} { usage }
+			set root [lindex $argv_copy 1]
+			set argv_copy [lrange $argv_copy 2 end]
+		}
+		--source-tcl {
+			set source_tcl 1
+			set argv_copy [lrange $argv_copy 1 end]
+		}
+		--run-exec {
+			set run_exec 1
+			set argv_copy [lrange $argv_copy 1 end]
+		}
+		--help - -h { usage }
+		default {
+			set task $a
+			set argv_copy [lrange $argv_copy 1 end]
+			break
+		}
+	}
+}
+if {$task eq ""} { usage }
+if {[llength $argv_copy] > 0} {
+	if {[lindex $argv_copy 0] ne "--"} { usage }
+	set user_argv [lrange $argv_copy 1 end]
+}
+if {$root eq ""} { set root [::abc::git_root] } else { set root [file normalize $root] }
+set ::abc::collector_source_tcl $source_tcl
+set ::abc::collector_run_exec $run_exec
+set ::argv_user $user_argv
+
+::abc::reset $root
+
+set task_path $task
+if {[file extension $task_path] ne ".abc"} {
+	if {[file exists "$task_path.abc"]} { set task_path "$task_path.abc" }
+}
+if {![file exists $task_path]} { ::abc::die "Input .abc not found: $task_path" }
+
+set task_noext [file rootname $task_path]
+::abc::import $task_noext
+if {[::abc::has_errors]} {
+	::tcl_puts stderr "ERROR: abc-export: encountered errors while traversing .abc:"
+	::abc::dump_errors
+	exit 3
+}
+
+	# Emit records.
+	foreach abs $::abc::src_order {
+		::tcl_puts "SRC\t[::abc::relpath_or_abs $abs]\t\t"
+	}
+	foreach abs $::abc::sim_order {
+		::tcl_puts "SIM\t[::abc::relpath_or_abs $abs]\t\t"
+	}
+	foreach key $::abc::xdc_order {
+		array set e $::abc::xdc($key)
+		set transitive 0
+		if {[info exists e(transitive)]} { set transitive $e(transitive) }
+		::tcl_puts "XDC\t[::abc::relpath_or_abs $e(path)]\t$e(used_in)\t$e(scope)\t$transitive"
+		array unset e
+	}
+	foreach key $::abc::prop_order {
+		foreach value [::abc::get_simset_property $key] {
+			::tcl_puts "PROP\t$key\t$value\t"
+		}
+	}
+	foreach key $::abc::unsupported_order {
+		array set e $::abc::unsupported($key)
+		::tcl_puts "UNSUPPORTED\t$e(command)\t$e(detail)\t"
+		array unset e
+	}
+	foreach action $::abc::actions {
+		set kind [lindex $action 0]
+		set arg [lindex $action 1]
+		::tcl_puts "ACTION\t$kind\t$arg\t"
+	}
+TCL
+} > "$TMP_TCL"
+
+chmod +x "$TMP_TCL" 2>/dev/null || true
+
+COLLECTOR_ARGS=(--root "$ROOT")
+if [[ $SOURCE_TCL -eq 1 ]]; then
+	COLLECTOR_ARGS+=(--source-tcl)
+fi
+if [[ $RUN_EXEC -eq 1 ]]; then
+	COLLECTOR_ARGS+=(--run-exec)
+fi
+
+RECORDS_RAW="$("$TCLSH" "$TMP_TCL" "${COLLECTOR_ARGS[@]}" "$INPUT" -- "${USER_ARGS[@]}")"
+if [[ -n "$RECORDS_RAW" ]]; then
+	mapfile -t RECORDS <<< "$RECORDS_RAW"
+else
+	RECORDS=()
+fi
+
+if [[ $RECORDS_ONLY -eq 1 ]]; then
+	printf '%s\n' "${RECORDS[@]}"
+	exit 0
+fi
+
+# Split into FILES for export (paths only) and capture metadata.
+FILES=()
+SRC_FILES=()
+SIM_FILES=()
+XDC_ROWS=()
+ACTION_ROWS=()
+# Track whether any XDC chain (parent or child of a source chain) was
+# recorded — if yes, all XDCs in the chain need tree-layout copy so the
+# parent's `source [file dirname [info script]] …` paths still resolve.
+HAS_XDC_CHAIN=0
+for rec in "${RECORDS[@]}"; do
+	IFS=$'\t' read -r kind value1 value2 value3 value4 <<< "$rec"
+	case "$kind" in
+		SRC)
+			FILES+=("$value1")
+			SRC_FILES+=("$value1")
+			;;
+		SIM)
+			FILES+=("$value1")
+			SIM_FILES+=("$value1")
+			;;
+		XDC)
+			# value4 = transitive flag (0|1). Default to 0 for older Tcl emitters.
+			local_transitive="${value4:-0}"
+			FILES+=("$value1")
+			XDC_ROWS+=("$value1	$value2	$value3	$local_transitive")
+			if [[ "$local_transitive" == "1" ]]; then
+				HAS_XDC_CHAIN=1
+			fi
+			;;
+		ACTION)
+			ACTION_ROWS+=("$value1	$value2")
+			;;
+	esac
+done
+
+INPUT_NAME="$(basename "$INPUT")"
+if [[ "$INPUT_NAME" == *.abc ]]; then
+	INPUT_STEM="${INPUT_NAME%.abc}"
+else
+	INPUT_STEM="$INPUT_NAME"
+fi
+
+export_relpath() {
+	local source_path="$1"
+	local kind="${2:-default}"   # "default" honors PRESERVE_TREE; "tree" forces tree.
+	local abs=""
+	local force_tree=0
+	if [[ "$kind" == "tree" ]]; then
+		force_tree=1
+	fi
+	if [[ $PRESERVE_TREE -eq 0 && $force_tree -eq 0 ]]; then
+		if [[ "$source_path" = /* ]]; then
+			abs="$source_path"
+		else
+			abs="$ROOT/$source_path"
+		fi
+		basename "$abs"
+		return
+	fi
+
+	if [[ "$source_path" = /* ]]; then
+		printf '_abs/%s\n' "${source_path#/}"
+	else
+		printf '%s\n' "$source_path"
+	fi
+}
+
+# When any XDC chain (parent + transitive `source` children) was
+# recorded, all XDC paths land in tree-layout so the parent's runtime
+# `[file dirname [info script]]` resolution finds its children at the
+# same relative offset as in the source repo. Source/sim files keep the
+# user's chosen flat-or-tree layout.
+declare -A IS_XDC_PATH
+if [[ $HAS_XDC_CHAIN -eq 1 ]]; then
+	for row in "${XDC_ROWS[@]}"; do
+		IFS=$'\t' read -r xdc_path _used_in _scope _transitive <<< "$row"
+		IS_XDC_PATH["$xdc_path"]=1
+	done
+fi
+
+COPIED=()
+declare -A EXPORT_REL_BY_SOURCE
+for p in "${FILES[@]}"; do
+	if [[ -n "${IS_XDC_PATH[$p]+x}" ]]; then
+		export_rel="$(export_relpath "$p" tree)"
+	else
+		export_rel="$(export_relpath "$p")"
+	fi
+	COPIED+=("$export_rel")
+	EXPORT_REL_BY_SOURCE["$p"]="$export_rel"
+done
+
+printf '%s\n' "${COPIED[@]}"
+
+if [[ $LIST_ONLY -eq 1 ]]; then
+	exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+
+# Collision detection and copy.
+declare -A SEEN_EXPORT_PATH
+COLLISION=0
+
+for p in "${FILES[@]}"; do
+	if [[ "$p" = /* ]]; then
+		abs="$p"
+	else
+		abs="$ROOT/$p"
+	fi
+	export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+	if [[ -n "${SEEN_EXPORT_PATH[$export_rel]+x}" && "${SEEN_EXPORT_PATH[$export_rel]}" != "$abs" ]]; then
+		if [[ $PRESERVE_TREE -eq 0 ]]; then
+			echo "ERROR: abc-export: basename collision for '$export_rel':" >&2
+		else
+			echo "ERROR: abc-export: export path collision for '$export_rel':" >&2
+		fi
+		echo "  - ${SEEN_EXPORT_PATH[$export_rel]}" >&2
+		echo "  - $abs" >&2
+		COLLISION=1
+		continue
+	fi
+	SEEN_EXPORT_PATH[$export_rel]="$abs"
+done
+
+if [[ $COLLISION -ne 0 ]]; then
+	exit 3
+fi
+
+for p in "${FILES[@]}"; do
+	if [[ "$p" = /* ]]; then
+		abs="$p"
+	else
+		abs="$ROOT/$p"
+	fi
+	export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+	mkdir -p "$OUT_DIR/$(dirname "$export_rel")"
+	# -p preserves timestamps, -f overwrites (we already checked collisions)
+	cp -pf "$abs" "$OUT_DIR/$export_rel"
+done
+
+# Generate a Vivado-friendly include script referencing local exported files.
+EXPORT_TCL="$OUT_DIR/add_to_vivado.tcl"
+{
+	echo "# Auto-generated by scripts/abc-export"
+	echo "#"
+	echo "# Usage (inside Vivado Tcl console or your flow):"
+	echo "#   source <this_file>"
+	echo "#"
+	echo "# Notes:"
+	echo "# - Adds all exported .sv/.v sources via read_verilog -sv"
+	echo "# - Applies XDC constraints with scoping as derived from .abc traversal"
+	echo
+	echo "set _export_script [file normalize [info script]]"
+	echo "set _export_dir [file dirname \$_export_script]"
+	echo
+	echo "puts \"Adding exported sources from: \$_export_dir\""
+	echo
+	echo "# --- Sources ---"
+	for p in "${SRC_FILES[@]}"; do
+		export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+		printf 'read_verilog -sv [file join $_export_dir {%s}]\n' "$(tcl_escape_braces "$export_rel")"
+	done
+	echo
+	echo "# --- Simulation-only files ---"
+	for p in "${SIM_FILES[@]}"; do
+		export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+		printf 'add_files -fileset [current_fileset -simset] [file join $_export_dir {%s}]\n' "$(tcl_escape_braces "$export_rel")"
+	done
+	echo
+	echo "# --- Constraints ---"
+	for row in "${XDC_ROWS[@]}"; do
+		xdc_path=$(printf '%s' "$row" | cut -f1)
+		used_in=$(printf '%s' "$row" | cut -f2)
+		scope=$(printf '%s' "$row" | cut -f3)
+		transitive=$(printf '%s' "$row" | cut -f4)
+		# Transitive XDCs are loaded by the parent's runtime `source`
+		# chain — copy only, do not emit explicit `read_xdc`.
+		if [[ "$transitive" == "1" ]]; then
+			continue
+		fi
+		export_rel="${EXPORT_REL_BY_SOURCE[$xdc_path]}"
+		tcl_export_rel="$(tcl_escape_braces "$export_rel")"
+		if [[ "$scope" == "TOP" ]]; then
+			printf 'set _xdc [read_xdc -unmanaged [file join $_export_dir {%s}]]\n' "$tcl_export_rel"
+		else
+			printf 'set _xdc [read_xdc -unmanaged -ref {%s} [file join $_export_dir {%s}]]\n' \
+				"$(tcl_escape_braces "$scope")" "$tcl_export_rel"
+		fi
+		if [[ "$used_in" == "implementation" || "$used_in" == "synthesis" ]]; then
+			echo "set_property USED_IN \"$used_in\" [get_files \$_xdc]"
+		fi
+		echo
+	done
+} > "$EXPORT_TCL"
+
+if [[ $GENERATE_ABC -eq 1 ]]; then
+	EXPORT_ABC="$OUT_DIR/$INPUT_STEM.abc"
+	{
+		echo "# Auto-generated by scripts/abc-export"
+		echo "# Replays exported local sources from this directory."
+		echo
+		echo "set _export_script [file normalize [info script]]"
+		echo "set _export_dir [file dirname \$_export_script]"
+		echo
+		for p in "${SRC_FILES[@]}"; do
+			export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+			printf 'read_sv [file join $_export_dir {%s}]\n' "$(tcl_escape_braces "$export_rel")"
+		done
+		if [[ ${#SIM_FILES[@]} -gt 0 ]]; then
+			echo
+			for p in "${SIM_FILES[@]}"; do
+				export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+				printf 'read_sim [file join $_export_dir {%s}]\n' "$(tcl_escape_braces "$export_rel")"
+			done
+		fi
+		if [[ ${#XDC_ROWS[@]} -gt 0 ]]; then
+			echo
+			for row in "${XDC_ROWS[@]}"; do
+				xdc_path=$(printf '%s' "$row" | cut -f1)
+				used_in=$(printf '%s' "$row" | cut -f2)
+				scope=$(printf '%s' "$row" | cut -f3)
+				transitive=$(printf '%s' "$row" | cut -f4)
+				# Transitive XDCs are loaded via the parent's runtime
+				# `source` chain — skip explicit read_xdc to avoid double-load.
+				if [[ "$transitive" == "1" ]]; then
+					continue
+				fi
+				export_rel="${EXPORT_REL_BY_SOURCE[$xdc_path]}"
+				tcl_export_rel="$(tcl_escape_braces "$export_rel")"
+				if [[ "$scope" == "TOP" ]]; then
+					printf 'set _xdc [read_xdc -unmanaged [file join $_export_dir {%s}]]\n' "$tcl_export_rel"
+				else
+					printf 'set _xdc [read_xdc -unmanaged -ref {%s} [file join $_export_dir {%s}]]\n' \
+						"$(tcl_escape_braces "$scope")" "$tcl_export_rel"
+				fi
+				if [[ "$used_in" == "implementation" || "$used_in" == "synthesis" ]]; then
+					echo "set_property USED_IN \"$used_in\" [get_files \$_xdc]"
+				fi
+			done
+		fi
+		if [[ ${#ACTION_ROWS[@]} -gt 0 ]]; then
+			echo
+			for row in "${ACTION_ROWS[@]}"; do
+				action=$(printf '%s' "$row" | cut -f1)
+				arg=$(printf '%s' "$row" | cut -f2)
+				printf '%s {%s}\n' "$action" "$(tcl_escape_braces "$arg")"
+			done
+		fi
+	} > "$EXPORT_ABC"
+fi
+
+# Write metadata files
+COPIED_LIST="$OUT_DIR/copied.list"
+SOURCES_LIST="$OUT_DIR/sources.list"
+
+printf '%s\n' "${COPIED[@]}" | LC_ALL=C sort > "$COPIED_LIST"
+
+# sources.list uses the paths as emitted by abc_export.tcl (relative-to-root when possible)
+printf '%s\n' "${FILES[@]}" | LC_ALL=C sort > "$SOURCES_LIST"
+
+DATE_ISO=$(date -Iseconds 2>/dev/null || date)
+USER_NAME=${USER:-unknown}
+HOST_NAME=$(hostname 2>/dev/null || echo unknown)
+GIT_REV=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY="clean"
+if ! git -C "$ROOT" diff --quiet 2>/dev/null; then
+	GIT_DIRTY="dirty"
+fi
+
+README="$OUT_DIR/README.md"
+{
+	printf '%s\n' "# ABC export"
+	printf '%s\n' ""
+	# Use single quotes so backticks are not treated as command substitution.
+	printf '%s\n' 'This directory was generated automatically by `scripts/abc-export`.'
+	printf '%s\n' ""
+	printf '%s\n' "## Provenance"
+	printf '%s\n' ""
+	printf '%s\n' "- **Input .abc**: $INPUT"
+	printf '%s\n' "- **Generated at**: $DATE_ISO"
+	printf '%s\n' "- **Generated by**: $USER_NAME@$HOST_NAME"
+	printf '%s\n' "- **Repository root**: $ROOT"
+	printf '%s\n' "- **Git revision**: $GIT_REV ($GIT_DIRTY)"
+	printf '%s\n' ""
+	printf '%s\n' "## Contents"
+	printf '%s\n' ""
+	if [[ $PRESERVE_TREE -eq 1 ]]; then
+		printf '%s\n' "- \`copied.list\`: list of paths copied into this directory while preserving the source tree."
+	else
+		printf '%s\n' "- \`copied.list\`: list of basenames that were copied into this directory (flat export)."
+	fi
+	printf '%s\n' "- \`sources.list\`: original source paths corresponding to the dependency traversal."
+	printf '%s\n' "- \`add_to_vivado.tcl\`: Vivado Tcl snippet to add all exported sources and apply constraints."
+	if [[ $GENERATE_ABC -eq 1 ]]; then
+		printf '%s\n' "- \`$INPUT_STEM.abc\`: replay \`.abc\` using the exported local files and recorded \`simulate\`/\`build\` actions."
+	fi
+	printf '%s\n' ""
+	printf '%s\n' "### Using the export in Vivado"
+	printf '%s\n' ""
+	printf '%s\n' "From within a Vivado Tcl session that already has an open project (and with CWD set to this export directory):"
+	printf '%s\n' ""
+	printf '%s\n' "\`\`\`tcl"
+	printf '%s\n' "source \"add_to_vivado.tcl\""
+	printf '%s\n' "\`\`\`"
+	if [[ $GENERATE_ABC -eq 1 ]]; then
+		printf '%s\n' ""
+		printf '%s\n' "### Using the exported .abc"
+		printf '%s\n' ""
+		printf '%s\n' "The generated \`$INPUT_STEM.abc\` is self-contained and replays exported sources from this directory."
+		printf '%s\n' "It also replays explicit \`simulate\` and \`build\` commands found during traversal."
+	fi
+	printf '%s\n' ""
+	printf '%s\n' "## Notes"
+	printf '%s\n' ""
+	if [[ $PRESERVE_TREE -eq 1 ]]; then
+		printf '%s\n' "- The export preserves the original repo-relative directory tree inside this directory."
+		printf '%s\n' "- Files outside the repo root are written below \`_abs/\`."
+	else
+		printf '%s\n' "- The export is *flat*. If two different source files had the same basename, the export would fail."
+	fi
+	printf '%s\n' "- Generated artifacts are not executed during export (external tools are stubbed)."
+} > "$README"
+
+echo "INFO: abc-export: exported ${#FILES[@]} files into $OUT_DIR" >&2

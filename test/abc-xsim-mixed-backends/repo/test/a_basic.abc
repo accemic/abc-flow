@@ -1,0 +1,2 @@
+read_sim a_basic_tb.sv
+simulate a_basic_tb

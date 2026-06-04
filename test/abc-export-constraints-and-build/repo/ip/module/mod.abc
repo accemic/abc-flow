@@ -1,0 +1,2 @@
+read_sv submod.sv
+constraints synth submod.xdc

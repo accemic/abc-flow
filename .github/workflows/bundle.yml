@@ -1,0 +1,117 @@
+name: bundle
+
+# Build a self-contained `abc-flow` install bundle and attach it to a
+# GitHub release. Fires on tag pushes that look like a version (`v*`)
+# and can be triggered manually for a one-off dev bundle.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required so the bundle job can create / update the release
+
+jobs:
+  # Gate: don't ship a bundle if the regression suites fail.
+  test:
+    name: regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tclsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tcl
+
+      - name: Run test suites
+        run: |
+          set -e
+          for t in test/test_abc_export.sh \
+                   test/test_abc_bundle.sh \
+                   test/test_abc_xsim.sh \
+                   test/test_abc_verilator.sh \
+                   test/test_abc_root_opt.sh; do
+            echo "=== $t ==="
+            bash "$t"
+          done
+
+  bundle:
+    name: tarball + release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version label
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Stage bundle contents
+        run: |
+          # Internal directory name is versionless so users' PATH entries
+          # survive upgrades — re-extracting overwrites in place. The
+          # archive *filename* carries the version for clarity.
+          mkdir abc-flow
+          # Ships in the install bundle:
+          #   abc/            the launcher tooling (abc, abc.tcl,
+          #                   abc-export, abc-bundle, abc.cmd,
+          #                   _abcflow/, _abc_collector.{tcl,sh})
+          #   README.md       user-facing entry doc
+          #   doc/            extended documentation
+          #   example/        the canonical worked example
+          #   LICENSE         if present at repo root
+          # Does NOT ship: test fixtures, scratch build dirs, repo metadata.
+          cp -R abc README.md doc example abc-flow/
+          [ -f LICENSE ] && cp LICENSE abc-flow/
+          find abc-flow -type d -name __pycache__ -prune -exec rm -rf {} +
+
+      - name: Pack tarball, zip and checksums
+        run: |
+          stem="abc-flow-${{ steps.ver.outputs.version }}"
+          tar -czf "${stem}.tar.gz" abc-flow
+          zip -rq "${stem}.zip" abc-flow
+          sha256sum "${stem}.tar.gz" "${stem}.zip" > "${stem}.sha256"
+          ls -la "${stem}".*
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abc-flow-bundle
+          path: |
+            abc-flow-*.tar.gz
+            abc-flow-*.zip
+            abc-flow-*.sha256
+
+      - name: Attach to release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            abc-flow-*.tar.gz
+            abc-flow-*.zip
+            abc-flow-*.sha256
+          generate_release_notes: true
+          body: |
+            ### Install (Linux / macOS)
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/abc-flow-${{ github.ref_name }}.tar.gz \
+              | tar xz -C ~/.local/share
+            echo 'export PATH="$HOME/.local/share/abc-flow/abc:$PATH"' >> ~/.bashrc
+            source ~/.bashrc
+            abc -h
+            ```
+
+            ### Install (Windows)
+
+            Download `abc-flow-${{ github.ref_name }}.zip`, extract anywhere, and add the extracted `abc\` directory to your `PATH`.
+
+            See the [README](../blob/${{ github.ref_name }}/README.md) for what to put in your `.abc` files and how the simulation backends differ.

@@ -1,0 +1,10 @@
+set trace [lindex $::argv_user 0]
+if { [llength $trace] == 0 } {
+	set trace fallback.bin
+}
+
+read_sim $trace
+set_property generic TRACE_SOURCE=[file tail $trace] [get_filesets sim_1]
+
+read_sim top_tb.sv
+simulate top_tb

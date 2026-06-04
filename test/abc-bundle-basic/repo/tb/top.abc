@@ -1,0 +1,4 @@
+import @ip/block/block
+source ../scripts/top_setup.tcl
+read_sim top_tb.sv
+simulate top_tb

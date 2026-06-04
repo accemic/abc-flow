@@ -1,0 +1,4 @@
+submod.sv
+top.sv
+submod.xdc
+top.xdc

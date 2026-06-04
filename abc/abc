@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""abc-flow launcher entry point.
+
+The implementation lives in the `_abcflow` package next to this script. This
+file stays here, adjacent to `abc.tcl` and `abc-export`, so the launcher
+can locate them as siblings — see `script_dir` in `_abcflow/main.py`.
+
+Layout of the implementation package:
+  _abcflow/core.py       - SimPlan, the Tcl-based collector, argv & output helpers
+  _abcflow/vivado.py     - Vivado discovery + full project flow
+  _abcflow/xsim.py       - Direct xvlog/xelab/xsim runner (with vivado fallback)
+  _abcflow/verilator.py  - `verilator --binary` runner (no Vivado)
+  _abcflow/main.py       - CLI parsing + backend dispatch (re-exported as `main`)
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Make the sibling `_abcflow` package importable when running this script
+# directly (no installation, no PYTHONPATH setup required).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _abcflow.main import main  # noqa: E402  -- path set up above
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

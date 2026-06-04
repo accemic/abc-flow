@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_abc_collector_lib.sh
+. "$SCRIPT_DIR/_abc_collector_lib.sh"
+
+usage() {
+	cat >&2 <<'USAGE'
+Usage:
+  scripts/abc-bundle <input.abc|input_without_ext> <out_dir>
+
+Behavior:
+  - Traverses .abc dependencies and collects:
+      imported/traversed .abc files,
+      read_sv/read_sim/constraints inputs,
+      and files referenced via source <file>
+  - Preserves repo-relative directory structure inside <out_dir>.
+  - Prints one bundled path per line relative to <out_dir>.
+
+Artifacts written into <out_dir>:
+  - README.md   : bundle metadata + notes
+  - bundle.list : tab-separated manifest as <kind>\t<copied_path>
+  - run_abc.sh  : helper wrapper to run abc with the bundle root preselected
+USAGE
+	exit 2
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+	usage
+fi
+
+if [[ $# -lt 2 ]]; then
+	usage
+fi
+
+INPUT="$1"
+OUT_DIR="$2"
+shift 2
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		*)
+			echo "ERROR: abc-bundle: unknown argument: $1" >&2
+			usage
+			;;
+	esac
+done
+
+ROOT="$(abc_collector_detect_root "$INPUT")"
+TCLSH="$(abc_collector_require_tclsh abc-bundle)"
+
+TMP_TCL="$(abc_collector_mktemp_tcl abc_bundle)"
+
+{
+	cat "$SCRIPT_DIR/_abc_collector.tcl"
+	cat <<'TCL'
+
+set ::abc::tool_name abc-bundle
+
+namespace eval abc {
+	array set seen_abc {}
+	array set kind_by_abs {}
+	variable record_order {}
+
+	proc reset {_anchor} {
+		variable anchor
+		set anchor [file normalize $_anchor]
+		array unset ::abc::seen_abc
+		array set ::abc::seen_abc {}
+		array unset ::abc::kind_by_abs
+		array set ::abc::kind_by_abs {}
+		variable record_order
+		set record_order {}
+		variable errors
+		set errors {}
+	}
+
+	proc record_abs {kind abs} {
+		set abs [file normalize $abs]
+		if {![file exists $abs]} {
+			add_error "Missing file: $abs"
+			return
+		}
+		if {![info exists ::abc::kind_by_abs($abs)]} {
+			set ::abc::kind_by_abs($abs) $kind
+			variable record_order
+			lappend record_order [list $kind $abs]
+		}
+	}
+
+	proc record_rel {kind path} {
+		record_abs $kind [file normalize [file join [pwd] $path]]
+	}
+
+	proc maybe_record_exec_arg {arg} {
+		variable anchor
+		if {[string match -* $arg]} {
+			return
+		}
+
+		if {[file pathtype $arg] eq "absolute"} {
+			set abs [file normalize $arg]
+		} else {
+			set abs [file normalize [file join [pwd] $arg]]
+		}
+
+		if {![file exists $abs] || [file isdirectory $abs]} {
+			return
+		}
+
+		set root [file normalize $anchor]
+		set rootp $root
+		if {![string match "*/" $rootp]} { append rootp "/" }
+		set under_root [expr {[string first $rootp $abs] == 0}]
+
+		set ext [string tolower [file extension $abs]]
+		set known_exts {.abc .sv .svh .v .vh .xdc .tcl .py .rdl .json .yaml .yml .wcfg .txt .cfg .ini .toml .h .hpp}
+		set known_ext [expr {[lsearch -exact $known_exts $ext] >= 0}]
+
+		if {$under_root || $known_ext} {
+			record_abs AUX $abs
+		}
+	}
+
+	proc source_abc_file {abc_file} {
+		set abs [file normalize $abc_file]
+		record_abs ABC $abs
+		if {[info exists ::abc::seen_abc($abs)]} {
+			return ""
+		}
+		set ::abc::seen_abc($abs) 1
+		set save_dir [pwd]
+		set ref [file tail [file rootname $abs]]
+		cd [file dirname $abs]
+		set rc [catch {::tcl_source [file tail $abs]} res opts]
+		cd $save_dir
+		if {$rc} {
+			return -options $opts $res
+		}
+		return $res
+	}
+
+	proc import {args} {
+		foreach dep [resolve {*}$args] {
+			set ref [file tail [file rootname $dep]]
+			set abc_file [file join [file dirname $dep] "$ref.abc"]
+			if {![file exists $abc_file]} {
+				add_error "Missing .abc: $abc_file"
+				continue
+			}
+			source_abc_file $abc_file
+		}
+	}
+
+	proc read_sv {args} {
+		foreach a $args { foreach p $a { record_rel SRC $p } }
+		return ""
+	}
+	proc read_sim {args} {
+		foreach a $args { foreach p $a { record_rel SIM $p } }
+		return ""
+	}
+	proc constraints {args} {
+		set rest {}
+		set idx 0
+		while {$idx < [llength $args]} {
+			set tok [lindex $args $idx]
+			switch -- $tok {
+				-top -
+				impl -
+				synth { incr idx; continue }
+				default { set rest [lrange $args $idx end]; break }
+			}
+		}
+		foreach a $rest { foreach p $a { record_rel XDC $p } }
+		return ""
+	}
+
+	proc read_verilog {args} {
+		set rest {}
+		set idx 0
+		while {$idx < [llength $args]} {
+			set tok [lindex $args $idx]
+			if {[string match -* $tok]} { incr idx; continue }
+			set rest [lrange $args $idx end]
+			break
+		}
+		foreach a $rest { foreach p $a { record_rel SRC $p } }
+		return ""
+	}
+	proc add_files {args} {
+		set rest {}
+		foreach tok $args {
+			if {[string match -* $tok]} { continue }
+			lappend rest $tok
+		}
+		foreach a $rest { foreach p $a { record_rel SIM $p } }
+		return ""
+	}
+	proc set_property {args} { return "" }
+	proc get_files {args} { return "" }
+	proc get_runs {args} { return "" }
+	proc current_fileset {args} { return "" }
+	proc current_run {args} { return "" }
+	proc export_ip_user_files {args} { return "" }
+	proc import_files {args} { return "" }
+	proc read_ip {args} { return "" }
+	proc build {args} { return "" }
+	proc simulate {args} { return "" }
+	proc synthesize {args} { return "" }
+	proc version {args} { return "0.0" }
+}
+
+if {[llength [info commands ::tcl_source]] == 0} {
+	rename ::source ::tcl_source
+}
+proc ::source {fileName args} {
+	set abs [file normalize [file join [pwd] $fileName]]
+	set ext [file extension $abs]
+	if {$ext eq ".abc"} {
+		return [::abc::source_abc_file $abs]
+	}
+	::abc::record_abs AUX $abs
+	return ""
+}
+
+# ::exec override; ::puts override comes from the shared collector preamble.
+if {[llength [info commands ::tcl_exec]] == 0} { rename ::exec ::tcl_exec }
+proc ::exec {args} {
+	foreach arg $args {
+		::abc::maybe_record_exec_arg $arg
+	}
+	return ""
+}
+
+proc usage {} {
+	::tcl_puts stderr "Usage: tclsh <collector.tcl> [--root <repo_root>] <task_or_abc>"
+	exit 2
+}
+
+set root ""
+set task ""
+
+set argv_copy $argv
+while {[llength $argv_copy] > 0} {
+	set a [lindex $argv_copy 0]
+	switch -- $a {
+		--root {
+			if {[llength $argv_copy] < 2} { usage }
+			set root [lindex $argv_copy 1]
+			set argv_copy [lrange $argv_copy 2 end]
+		}
+		--help - -h { usage }
+		default {
+			set task $a
+			set argv_copy [lrange $argv_copy 1 end]
+			break
+		}
+	}
+}
+if {$task eq ""} { usage }
+if {$root eq ""} { set root [::abc::git_root] } else { set root [file normalize $root] }
+
+::abc::reset $root
+
+set task_path $task
+if {[file extension $task_path] ne ".abc"} {
+	if {[file exists "$task_path.abc"]} { set task_path "$task_path.abc" }
+}
+if {![file exists $task_path]} { ::abc::die "Input .abc not found: $task_path" }
+
+::abc::source_abc_file [file normalize $task_path]
+if {[::abc::has_errors]} {
+	::tcl_puts stderr "ERROR: abc-bundle: encountered errors while traversing .abc:"
+	::abc::dump_errors
+	exit 3
+}
+
+foreach item $::abc::record_order {
+	set kind [lindex $item 0]
+	set abs [lindex $item 1]
+	::tcl_puts "$kind\t[::abc::relpath_or_abs $abs]"
+}
+TCL
+} > "$TMP_TCL"
+
+chmod +x "$TMP_TCL" 2>/dev/null || true
+
+RECORDS_RAW="$("$TCLSH" "$TMP_TCL" --root "$ROOT" "$INPUT")"
+if [[ -n "$RECORDS_RAW" ]]; then
+	mapfile -t RECORDS <<< "$RECORDS_RAW"
+else
+	RECORDS=()
+fi
+
+export_relpath() {
+	local source_path="$1"
+	if [[ "$source_path" = /* ]]; then
+		printf '_abs/%s\n' "${source_path#/}"
+	else
+		printf '%s\n' "$source_path"
+	fi
+}
+
+KINDS=()
+FILES=()
+COPIED=()
+declare -A EXPORT_REL_BY_SOURCE
+for rec in "${RECORDS[@]}"; do
+	IFS=$'\t' read -r kind path <<< "$rec"
+	export_rel="$(export_relpath "$path")"
+	KINDS+=("$kind")
+	FILES+=("$path")
+	COPIED+=("$export_rel")
+	EXPORT_REL_BY_SOURCE["$path"]="$export_rel"
+done
+
+printf '%s\n' "${COPIED[@]}"
+
+mkdir -p "$OUT_DIR"
+
+declare -A SEEN_EXPORT_PATH
+COLLISION=0
+for p in "${FILES[@]}"; do
+	if [[ "$p" = /* ]]; then
+		abs="$p"
+	else
+		abs="$ROOT/$p"
+	fi
+	export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+	if [[ -n "${SEEN_EXPORT_PATH[$export_rel]+x}" && "${SEEN_EXPORT_PATH[$export_rel]}" != "$abs" ]]; then
+		echo "ERROR: abc-bundle: export path collision for '$export_rel':" >&2
+		echo "  - ${SEEN_EXPORT_PATH[$export_rel]}" >&2
+		echo "  - $abs" >&2
+		COLLISION=1
+		continue
+	fi
+	SEEN_EXPORT_PATH[$export_rel]="$abs"
+done
+
+if [[ $COLLISION -ne 0 ]]; then
+	exit 3
+fi
+
+for p in "${FILES[@]}"; do
+	if [[ "$p" = /* ]]; then
+		abs="$p"
+	else
+		abs="$ROOT/$p"
+	fi
+	export_rel="${EXPORT_REL_BY_SOURCE[$p]}"
+	mkdir -p "$OUT_DIR/$(dirname "$export_rel")"
+	cp -pf "$abs" "$OUT_DIR/$export_rel"
+done
+
+BUNDLE_LIST="$OUT_DIR/bundle.list"
+: > "$BUNDLE_LIST"
+for idx in "${!FILES[@]}"; do
+	printf '%s\t%s\n' "${KINDS[$idx]}" "${COPIED[$idx]}" >> "$BUNDLE_LIST"
+done
+
+RUN_ABC="$OUT_DIR/run_abc.sh"
+{
+	echo '#!/usr/bin/env bash'
+	echo 'set -euo pipefail'
+	echo 'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+	echo 'exec abc "$@" "-root=$ROOT"'
+} > "$RUN_ABC"
+chmod +x "$RUN_ABC"
+
+DATE_ISO=$(date -Iseconds 2>/dev/null || date)
+USER_NAME=${USER:-unknown}
+HOST_NAME=$(hostname 2>/dev/null || echo unknown)
+GIT_REV=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY="clean"
+if ! git -C "$ROOT" diff --quiet 2>/dev/null; then
+	GIT_DIRTY="dirty"
+fi
+
+README="$OUT_DIR/README.md"
+{
+	printf '%s\n' "# ABC bundle"
+	printf '%s\n' ""
+	printf '%s\n' 'This directory was generated automatically by `scripts/abc-bundle`.'
+	printf '%s\n' ""
+	printf '%s\n' "## Provenance"
+	printf '%s\n' ""
+	printf '%s\n' "- **Input .abc**: $INPUT"
+	printf '%s\n' "- **Generated at**: $DATE_ISO"
+	printf '%s\n' "- **Generated by**: $USER_NAME@$HOST_NAME"
+	printf '%s\n' "- **Repository root**: $ROOT"
+	printf '%s\n' "- **Git revision**: $GIT_REV ($GIT_DIRTY)"
+	printf '%s\n' ""
+	printf '%s\n' "## Contents"
+	printf '%s\n' ""
+	printf '%s\n' "- \`bundle.list\`: tab-separated manifest as \`kind<TAB>copied_path\`."
+	printf '%s\n' "- \`run_abc.sh\`: helper wrapper that runs \`abc\` with the bundle root preselected."
+	printf '%s\n' "- Imported/traversed \`.abc\` files are bundled alongside referenced source and helper files."
+	printf '%s\n' ""
+	printf '%s\n' "## Notes"
+	printf '%s\n' ""
+	printf '%s\n' "- The original repo-relative directory structure is preserved inside this directory."
+	printf '%s\n' "- Files outside the repo root are written below \`_abs/\`."
+	printf '%s\n' "- Sourced helper files are copied but not executed during bundling."
+	printf '%s\n' "- Bundled original \`.abc\` files are preserved for reference; use \`abc-export\` when you want a replay-oriented export."
+	printf '%s\n' "- To rerun the bundle in-place, prefer \`./run_abc.sh -new -sim modules/...\` from this directory."
+} > "$README"
+
+echo "INFO: abc-bundle: bundled ${#FILES[@]} files into $OUT_DIR" >&2

@@ -1,0 +1,2 @@
+rtl/alu_core.sv
+tb/alu_smoke.sv

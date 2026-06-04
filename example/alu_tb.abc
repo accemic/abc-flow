@@ -1,0 +1,3 @@
+import    alu_top
+read_sim  alu_tb.sv
+simulate  alu_tb

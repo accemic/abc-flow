@@ -1,0 +1,4 @@
+import ../rtl/core
+read_sim payload.bin
+read_sim top_tb.sv
+simulate top_tb

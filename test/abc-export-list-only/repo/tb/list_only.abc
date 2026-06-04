@@ -1,0 +1,2 @@
+import ../rtl/simple_block
+read_sim list_only_tb.sv

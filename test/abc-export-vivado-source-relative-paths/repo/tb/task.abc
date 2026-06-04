@@ -1,0 +1,2 @@
+import ../rtl/rtl
+read_sim tb.sv

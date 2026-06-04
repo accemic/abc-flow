@@ -1,0 +1,3 @@
+import @ip/helper
+read_sim stub_check_tb.sv
+simulate stub_check_tb

@@ -1,0 +1,4 @@
+import @ip/left/shared
+import @ip/right/shared
+read_sim preserve_tb.sv
+simulate preserve_tb

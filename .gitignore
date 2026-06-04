@@ -1,0 +1,4 @@
+bld/
+__pycache__/
+*.pyc
+.private/

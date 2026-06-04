@@ -1,0 +1,3 @@
+import ../rtl/alu_core
+read_sim alu_smoke.sv
+simulate alu_smoke

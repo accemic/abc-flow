@@ -1,0 +1,5 @@
+read_sim ../lib/dep_pkg.sv
+read_sim ../lib/base_pkg.sv
+read_sv ../lib/consumer.sv
+read_sim top_tb.sv
+simulate top_tb

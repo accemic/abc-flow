@@ -1,0 +1,8 @@
+set_property part xczu11eg-ffvb1517-1-e [current_project]
+set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {-mode out_of_context} -objects [current_run -synthesis]
+
+read_sv synth_top.sv
+build synth_top
+
+read_sim top_tb.sv
+simulate top_tb

@@ -1,0 +1,6 @@
+set _this_dir [file dirname [info script]]
+set _repo_root [file normalize [file join $_this_dir ..]]
+set _tool [file join $_repo_root tools generate_data.py]
+set _rdl [file join $_repo_root data input.rdl]
+exec python3 $_tool $_rdl output.txt
+read_sv mod.sv

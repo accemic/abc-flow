@@ -1,0 +1,10 @@
+ABC	tb/top.abc
+ABC	ip/block/block.abc
+ABC	common/helpers/python_helper.abc
+AUX	.gitutils/abc_python.tcl
+SRC	common/helpers/helper_pkg.sv
+AUX	common/data/block_rules.yaml
+SRC	ip/block/block.sv
+XDC	ip/block/block.xdc
+AUX	scripts/top_setup.tcl
+SIM	tb/top_tb.sv

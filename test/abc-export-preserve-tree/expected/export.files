@@ -1,0 +1,8 @@
+README.md
+add_to_vivado.tcl
+copied.list
+ip/left/shared.sv
+ip/right/shared.sv
+preserve.abc
+sources.list
+tb/preserve_tb.sv

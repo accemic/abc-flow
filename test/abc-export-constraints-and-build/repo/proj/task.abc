@@ -1,0 +1,4 @@
+import @ip/module/mod
+read_sv top.sv
+constraints -top impl top.xdc
+build top_mod

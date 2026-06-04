@@ -1,0 +1,4 @@
+import @common/helpers/python_helper
+source ../../common/data/block_rules.yaml
+read_sv block.sv
+constraints synth block.xdc

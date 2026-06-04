@@ -1,0 +1,8 @@
+create_ip -name vio -vendor xilinx.com -library ip -version 3.0 -module_name vio_0
+set_property -dict {
+  CONFIG.C_NUM_PROBE_IN {0}
+  CONFIG.C_NUM_PROBE_OUT {1}
+} [get_ips vio_0]
+
+read_sv vio_block.sv
+build vio_block

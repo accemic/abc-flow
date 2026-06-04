@@ -1,0 +1,4 @@
+dep/common.sv
+proj/tb.sv
+proj/top.sv
+proj/waveform.wcfg

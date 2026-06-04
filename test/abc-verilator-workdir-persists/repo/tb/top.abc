@@ -1,0 +1,2 @@
+read_sim top_tb.sv
+simulate top_tb

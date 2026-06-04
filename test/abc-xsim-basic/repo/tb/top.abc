@@ -1,0 +1,8 @@
+import ../rtl/core
+set _gen_cmd {printf 'module generated_mod; endmodule\n' > generated.sv}
+exec sh -c $_gen_cmd
+read_sv generated.sv
+source helper.tcl
+read_sim payload.bin
+read_sim top_tb.sv
+simulate top_tb

@@ -1,0 +1,8 @@
+tb/top.abc
+ip/block/block.abc
+common/helpers/python_helper.abc
+common/data/block_rules.yaml
+ip/block/block.sv
+ip/block/block.xdc
+scripts/top_setup.tcl
+tb/top_tb.sv

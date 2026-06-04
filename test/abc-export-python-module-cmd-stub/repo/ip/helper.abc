@@ -1,0 +1,6 @@
+set _this_dir [file dirname [info script]]
+set _repo_root [file normalize [file join $_this_dir ..]]
+source [file join $_repo_root .gitutils abc_python.tcl]
+set _tool_cmd [abc_py::python_module_cmd demo_tool]
+exec {*}${_tool_cmd} --version
+read_sv helper.sv

@@ -1,0 +1,2 @@
+read_sv build_only.sv
+build build_only

@@ -1,0 +1,8 @@
+import @dep/mod
+import @dep/mod
+read_sv top.sv
+read_sv top.sv
+source helper.tcl
+source waveform.wcfg
+read_sim tb.sv
+simulate tb_top

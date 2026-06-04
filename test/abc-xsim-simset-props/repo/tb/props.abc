@@ -1,0 +1,8 @@
+read_sim props_tb.sv
+
+set_property generic WIDTH=7 [get_filesets sim_1]
+set_property generic [concat [get_property generic [current_fileset -simset]] DEPTH=3] [current_fileset -simset]
+set_property verilog_define [concat [get_property verilog_define [current_fileset -simset]] FLAG=1] [current_fileset -simset]
+set_property -name {xsim.simulate.xsim.more_options} -value {-testplusarg "CYCLES=42"} -objects [current_fileset -simset]
+
+simulate props_tb

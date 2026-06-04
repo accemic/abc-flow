@@ -1,0 +1,3 @@
+ip/left/shared.sv
+ip/right/shared.sv
+tb/preserve_tb.sv

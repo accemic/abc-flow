@@ -1,0 +1,7 @@
+import ../rtl/core
+
+read_sim wrapper_tb.sv
+simulate wrapper_tb
+
+read_sv ../rtl/synth_wrapper.sv
+build synth_wrapper

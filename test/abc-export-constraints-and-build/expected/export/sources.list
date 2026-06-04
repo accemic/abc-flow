@@ -1,0 +1,4 @@
+ip/module/submod.sv
+ip/module/submod.xdc
+proj/top.sv
+proj/top.xdc
