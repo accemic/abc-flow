@@ -79,6 +79,15 @@ if [[ -n "$obj_dir" && -n "$out_name" ]]; then
 set -euo pipefail
 printf 'verilator_sim %s\n' "$*" >>"$ABC_TOOL_LOG"
 printf 'verilator_sim_cwd %s\n' "$PWD" >>"$ABC_TOOL_LOG"
+# Emulate Verilator writing a coverage data file when asked via the
+# +verilator+coverage+file+<name> runtime plusarg, so the launcher's
+# coverage post-processing has data to act on.
+for arg in "$@"; do
+	case "$arg" in
+		+verilator+coverage+file+*)
+			: >"$PWD/${arg#+verilator+coverage+file+}";;
+	esac
+done
 # Emulate a testbench writing an output dump into its run cwd, so tests
 # can assert the file persists after the run.
 echo "stub-dump" > "$PWD/sim_dump.out"
@@ -90,6 +99,38 @@ BIN
 fi
 EOF
 	chmod +x "$tool_root/bin/verilator"
+
+	# Stub verilator_coverage: log argv and honor --write-info/--annotate so
+	# the launcher's follow-up existence checks behave like the real tool.
+	cat >"$tool_root/bin/verilator_coverage" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'verilator_coverage %s\n' "$*" >>"$ABC_TOOL_LOG"
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--write-info) : >"$2"; shift 2;;
+		--annotate) mkdir -p "$2"; shift 2;;
+		*) shift;;
+	esac
+done
+EOF
+	chmod +x "$tool_root/bin/verilator_coverage"
+
+	# Stub genhtml: log argv and create the output dir + index.html.
+	cat >"$tool_root/bin/genhtml" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'genhtml %s\n' "$*" >>"$ABC_TOOL_LOG"
+out=""
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-o) out="$2"; shift 2;;
+		*) shift;;
+	esac
+done
+[[ -n "$out" ]] && { mkdir -p "$out"; : >"$out/index.html"; }
+EOF
+	chmod +x "$tool_root/bin/genhtml"
 }
 
 run_case() {

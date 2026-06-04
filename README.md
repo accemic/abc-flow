@@ -127,6 +127,16 @@ $ abc --sim-backend xsim -sim alu_tb.abc       # direct XSim
 $ abc --sim-backend verilator -sim alu_tb.abc  # Verilator (no Vivado needed)
 ```
 
+Add `--coverage` to a Verilator run to collect line coverage. It builds
+with `--coverage-line`, then writes `coverage.info` (lcov) and an
+annotated source tree into the `<task>.vsim/` work dir; if `genhtml` is
+installed it also renders an HTML report. For the ALU example this flags
+the unreachable `default:` arm of the `case` as the one uncovered line:
+
+```bash
+$ abc --sim-backend verilator -sim --coverage alu_tb.abc
+```
+
 Set a project-wide default in `.abc.config` (see below) to avoid passing
 `--sim-backend` every time.
 

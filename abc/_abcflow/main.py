@@ -25,6 +25,7 @@ from _abcflow.core import (
     enable_windows_vt_mode,
     eprint,
     expand_tasks,
+    extract_flag,
     extract_opt,
     extract_root_override,
     find_git_root,
@@ -58,7 +59,7 @@ def print_help() -> None:
         """abc - .abc dependency-driven build/sim launcher
 
 Usage:
-  abc [--vivado-version YYYY.X] [--sim-backend vivado|xsim|verilator] [ABC options] [paths...]
+  abc [--vivado-version YYYY.X] [--sim-backend vivado|xsim|verilator] [--coverage] [ABC options] [paths...]
 
 Notes:
   - All arguments except launcher-only options are forwarded to abc.tcl as -tclargs.
@@ -93,6 +94,13 @@ Options:
       tasks fail with a clear error instead of falling back to Vivado.
       A configured xsim/verilator default applies only to -sim runs;
       -synth/-impl/-bitgen/-gui always use Vivado.
+
+  --coverage
+      Collect Verilator line coverage for the -sim run (requires
+      --sim-backend verilator). Builds with `--coverage-line`, then runs
+      `verilator_coverage` to write coverage.info (lcov) and an annotated/
+      source tree into the <task>.vsim/ work dir. If `genhtml` is on PATH,
+      an HTML report is also rendered to <task>.vsim/coverage_html/.
 
   -log <file>
       Passed through to Vivado. (This is a Vivado option, not an abc.tcl option.)
@@ -136,6 +144,7 @@ def main(argv: List[str]) -> int:
     try:
         forced_version, argv = extract_opt(argv, "--vivado-version")
         sim_backend, argv = extract_opt(argv, "--sim-backend")
+        coverage, argv = extract_flag(argv, "--coverage")
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
@@ -221,6 +230,13 @@ def main(argv: List[str]) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    if coverage and sim_backend != "verilator":
+        print(
+            "Error: --coverage is only supported with --sim-backend verilator.",
+            file=sys.stderr,
+        )
+        return 2
 
     # If we can't infer whether sim or impl is intended (e.g. -gui only) and
     # there is no unique config default, tell the user about the explicit override.
@@ -330,6 +346,7 @@ def main(argv: List[str]) -> int:
                     argv_user=argv_user,
                     use_filter=use_filter,
                     use_color=use_color,
+                    coverage=coverage,
                 )
             except Exception as e:
                 print(f"Error: {e}", file=sys.stderr)

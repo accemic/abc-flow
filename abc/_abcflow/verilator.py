@@ -34,6 +34,7 @@ def run_direct_verilator_task(
     argv_user: List[str],
     use_filter: bool,
     use_color: bool,
+    coverage: bool = False,
 ) -> int:
     if not plan.simulate_tops:
         eprint(f"abc: info: no simulate action recorded for {task}; skipping verilator run")
@@ -54,6 +55,12 @@ def run_direct_verilator_task(
     work_dir.mkdir(parents=True, exist_ok=True)
     eprint(f"abc: verilator work dir: {work_dir}")
     stage_sim_support_files(plan, work_dir)
+
+    if coverage:
+        # Drop stale coverage data from a prior run so the report reflects
+        # only this run (the work dir is persistent and reused).
+        for old in work_dir.glob("coverage_*.dat"):
+            old.unlink()
 
     for top in plan.simulate_tops:
         snapshot = sanitize_snapshot_name(top)
@@ -79,6 +86,8 @@ def run_direct_verilator_task(
             "-o",
             snapshot,
         ]
+        if coverage:
+            compile_cmd.append("--coverage-line")
         for define in unique_strings(plan.sim_verilog_defines):
             compile_cmd.extend(["-D", define])
         for generic in unique_strings(plan.sim_generics):
@@ -98,7 +107,12 @@ def run_direct_verilator_task(
         # labels. Run the sim line-buffered so each $display flushes
         # before the next $system. `stdbuf` is GNU coreutils; if it is
         # not available, fall back to the unwrapped binary.
-        sim_cmd = [str(sim_bin), *argv_user]
+        sim_cmd = [str(sim_bin)]
+        if coverage:
+            # One coverage file per top so multiple simulate tops don't clobber
+            # each other; verilator_coverage merges them for the report.
+            sim_cmd.append(f"+verilator+coverage+file+coverage_{snapshot}.dat")
+        sim_cmd.extend(argv_user)
         stdbuf = shutil.which("stdbuf")
         if stdbuf:
             sim_cmd = [stdbuf, "-oL", "-eL", *sim_cmd]
@@ -107,4 +121,55 @@ def run_direct_verilator_task(
         )
         if rc != 0:
             return rc
+
+    if coverage:
+        _emit_coverage_reports(work_dir, use_filter=use_filter, use_color=use_color)
     return 0
+
+
+def _emit_coverage_reports(work_dir: Path, *, use_filter: bool, use_color: bool) -> None:
+    """Post-process Verilator coverage data into lcov + annotated + HTML reports.
+
+    Best-effort: a missing tool or missing data emits a warning and returns
+    without failing the simulation run that produced the data.
+    """
+    dats = sorted(work_dir.glob("coverage_*.dat"))
+    if not dats:
+        eprint("abc: warning: --coverage was set but no coverage data was produced")
+        return
+
+    vcov = shutil.which("verilator_coverage")
+    if not vcov:
+        eprint("abc: warning: verilator_coverage not found on PATH; skipping coverage report")
+        return
+
+    dat_args = [str(d) for d in dats]
+    info = work_dir / "coverage.info"
+    annotated = work_dir / "annotated"
+
+    # lcov-format info file (consumed by genhtml, VSCode Coverage Gutters, etc.)
+    run_streaming_command(
+        [vcov, "--write-info", str(info), *dat_args],
+        cwd=work_dir, use_filter=use_filter, use_color=use_color,
+    )
+    # Annotated source tree: per-line hit counts, %000000 on uncovered lines.
+    # --annotate-all includes fully-covered files too, not just ones with gaps.
+    run_streaming_command(
+        [vcov, "--annotate", str(annotated), "--annotate-all", "--annotate-min", "1", *dat_args],
+        cwd=work_dir, use_filter=use_filter, use_color=use_color,
+    )
+
+    eprint(f"abc: coverage: lcov info  {info}")
+    eprint(f"abc: coverage: annotated  {annotated}")
+
+    genhtml = shutil.which("genhtml")
+    if genhtml and info.exists():
+        html_dir = work_dir / "coverage_html"
+        rc = run_streaming_command(
+            [genhtml, "-o", str(html_dir), str(info)],
+            cwd=work_dir, use_filter=use_filter, use_color=use_color,
+        )
+        if rc == 0:
+            eprint(f"abc: coverage: html      {html_dir / 'index.html'}")
+    elif not genhtml:
+        eprint("abc: note: genhtml not on PATH; skipping HTML report (open coverage.info instead)")

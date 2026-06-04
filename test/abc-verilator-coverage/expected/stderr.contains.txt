@@ -1,0 +1,2 @@
+simulation backend is verilator
+abc: coverage: lcov info

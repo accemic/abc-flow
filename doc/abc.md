@@ -177,6 +177,28 @@ Both backends require `-sim` and headless operation (no `-gui`,
 abc --sim-backend verilator -sim example/alu_tb.abc
 ```
 
+### Line coverage (Verilator)
+
+Add `--coverage` to a Verilator `-sim` run to collect line coverage. It
+is supported **only** with `--sim-backend verilator`; combining it with
+any other backend is an error. The build is instrumented with Verilator's
+`--coverage-line`, and after the run `verilator_coverage` post-processes
+the raw data into the `<task>.vsim/` work dir:
+
+```bash
+abc --sim-backend verilator -sim --coverage example/alu_tb.abc
+```
+
+| Output | Description |
+|--------|-------------|
+| `coverage.info` | lcov format — consumed by `genhtml`, the VSCode *Coverage Gutters* extension, Codecov, etc. |
+| `annotated/*.sv` | Per-line hit counts; uncovered lines marked `%000000`. |
+| `coverage_html/index.html` | HTML report — only when `genhtml` (from `lcov`) is on `PATH`; otherwise skipped with a note. |
+
+Each simulated top writes its own `coverage_<top>.dat`; `verilator_coverage`
+merges them for the report. Reporting is best-effort: if `verilator_coverage`
+or `genhtml` is missing, `abc` warns and the simulation result is unaffected.
+
 ### Choosing a default backend
 
 Rather than passing `--sim-backend` every time, set a project-wide
