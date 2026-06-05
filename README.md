@@ -151,7 +151,7 @@ abc --vivado-version 2024.1 -gui myproj.abc
 
 ## License
 
-MIT — see [LICENSE](LICENSE). © 2023-2026 Accemic Technologies GmbH.
+ISC — see [LICENSE](LICENSE). © 2023-2026 Accemic Technologies GmbH.
 
 Authors: [Accemic Technologies GmbH](https://www.accemic.com) — Thomas
 Preußer, Albert Schulz.
