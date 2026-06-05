@@ -155,3 +155,13 @@ ISC — see [LICENSE](LICENSE). © 2023-2026 Accemic Technologies GmbH.
 
 Authors: [Accemic Technologies GmbH](https://www.accemic.com) — Thomas
 Preußer, Albert Schulz.
+
+## Trademarks
+
+Vivado, Xilinx, and the Xilinx Vivado Simulator (XSim) are trademarks of
+Advanced Micro Devices, Inc. Python is a registered trademark of the Python
+Software Foundation. Git is a registered trademark of Software Freedom
+Conservancy. All other product and company names are the trademarks or
+registered trademarks of their respective owners. Their use here is for
+identification only and does not imply any affiliation with or endorsement
+by them.
