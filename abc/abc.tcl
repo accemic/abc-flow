@@ -303,7 +303,11 @@ namespace eval abc {
 					set_property BITSTREAM.GENERAL.COMPRESS true [current_design]
 					write_bitstream    -force -bin_file [file join $proj_dir $top.bit]
 					write_debug_probes -force           [file join $proj_dir $top.ltx]
-					write_hw_platform  -fixed -force -file [file join $proj_dir $top.xsa]
+					# write_hw_platform needs block-design metadata; skip the XSA
+					# for pure-RTL projects instead of aborting the whole run.
+					if { [llength [get_files -quiet *.bd]] } {
+						write_hw_platform  -fixed -force -file [file join $proj_dir $top.xsa]
+					}
 				}
 			}
 
