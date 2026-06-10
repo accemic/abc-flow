@@ -286,6 +286,14 @@ namespace eval abc {
 				set_property -name {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} -value {-mode out_of_context} -objects $run
 			}
 
+			# On a reused project the previous pass left the runs 'complete'
+			# and Vivado refuses to relaunch them. All user sources were
+			# stripped and re-added anyway, so reset before launching. IP OOC
+			# runs are untouched and keep their up-to-date results.
+			foreach r [list [current_run -synthesis] $run] {
+				if { [get_property PROGRESS $r] ne "0%" } { reset_run $r }
+			}
+
 			launch_run $run -jobs $jobs
 			wait_on_run $run
 
